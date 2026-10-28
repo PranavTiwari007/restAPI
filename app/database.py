@@ -1,115 +1,89 @@
-from contextlib import closing
-from pathlib import Path
+import re
 import sqlite3
+from pathlib import Path
 
-from app.state_mapping import AircraftStateRecord
-
-
-DEFAULT_DATABASE_PATH = Path("data/aircraft.db")
-SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
-BoundsValues = tuple[float, float, float, float]
+DB_FILE = Path(__file__).resolve().parent.parent / "data" / "airzone.db"
+CELL = 4  
 
 
-def connect(database_path: Path | str = DEFAULT_DATABASE_PATH) -> sqlite3.Connection:
-    path = str(database_path)
-    if path != ":memory:":
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-    connection = sqlite3.connect(path)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+SEED = [
+    ("mumbai", "Mumbai region", 17.5, 71.5, 20.5, 74.5),
+    ("chennai", "Chennai region", 11.0, 78.0, 14.0, 81.0),
+    ("london", "London region", 50.0, -3.0, 53.0, 1.0),
+    ("new-york", "New York region", 39.0, -76.0, 42.0, -72.0),
+]
 
 
-def initialize_database(database_path: Path | str = DEFAULT_DATABASE_PATH) -> None:
-    schema = SCHEMA_PATH.read_text(encoding="utf-8")
-    with closing(connect(database_path)) as connection:
-        connection.executescript(schema)
+def connect():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def save_snapshot(
-    connection: sqlite3.Connection,
-    provider_time: int,
-    bounds: BoundsValues,
-    states: list[AircraftStateRecord],
-) -> int:
-    with connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO snapshots (provider_time, lamin, lomin, lamax, lomax)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (provider_time, *bounds),
-        )
-        snapshot_id = cursor.lastrowid
-        if snapshot_id is None:
-            raise sqlite3.DatabaseError("SQLite did not return a snapshot ID")
-
-        connection.executemany(
-            """
-            INSERT INTO aircraft_states (
-                snapshot_id, icao24, callsign, origin_country, last_contact,
-                longitude, latitude, baro_altitude, on_ground, velocity,
-                true_track, vertical_rate, geo_altitude, squawk, position_source
-            )
-            VALUES (
-                :snapshot_id, :icao24, :callsign, :origin_country, :last_contact,
-                :longitude, :latitude, :baro_altitude, :on_ground, :velocity,
-                :true_track, :vertical_rate, :geo_altitude, :squawk,
-                :position_source
-            )
-            """,
-            [
-                {
-                    **state,
-                    "snapshot_id": snapshot_id,
-                    "on_ground": int(state["on_ground"]),
-                }
-                for state in states
-            ],
-        )
-
-    return snapshot_id
+def init_db():
+    with connect() as c:
+        
+        c.execute("""CREATE TABLE IF NOT EXISTS zones (
+            zone_id TEXT PRIMARY KEY, name TEXT NOT NULL,
+            lamin REAL, lomin REAL, lamax REAL, lomax REAL)""")
+        
+        c.execute("""CREATE TABLE IF NOT EXISTS aircraft_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, icao24 TEXT NOT NULL, callsign TEXT,
+            origin_country TEXT, latitude REAL, longitude REAL, baro_altitude REAL,
+            velocity REAL, true_track REAL, on_ground INTEGER, last_contact INTEGER,
+            observed_at INTEGER NOT NULL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_obs ON aircraft_observations (icao24, id)")
+        c.executemany("INSERT OR IGNORE INTO zones VALUES (?,?,?,?,?,?)", SEED)
 
 
-def get_latest_snapshot(connection: sqlite3.Connection) -> sqlite3.Row | None:
-    return connection.execute(
-        """
-        SELECT snapshots.*, COUNT(aircraft_states.id) AS state_count
-        FROM snapshots
-        LEFT JOIN aircraft_states ON aircraft_states.snapshot_id = snapshots.id
-        WHERE snapshots.id = (SELECT id FROM snapshots ORDER BY id DESC LIMIT 1)
-        GROUP BY snapshots.id
-        """
-    ).fetchone()
+def cell_zone(zone_id):
+    """Grid zone ids look like R12C40 (row/column). Bounds are computed from the id."""
+    m = re.fullmatch(r"R(\d+)C(\d+)", zone_id)
+    if not m:
+        return None
+    row, col = int(m[1]), int(m[2])
+    if row >= 180 // CELL or col >= 360 // CELL:
+        return None
+    lamin, lomin = row * CELL - 90, col * CELL - 180
+    return (zone_id, f"Grid {zone_id}", lamin, lomin, lamin + CELL, lomin + CELL)
 
 
-def list_latest_aircraft_states(
-    connection: sqlite3.Connection,
-) -> list[sqlite3.Row]:
-    return connection.execute(
-        """
-        SELECT aircraft_states.*, snapshots.provider_time, snapshots.imported_at
-        FROM aircraft_states
-        JOIN snapshots ON snapshots.id = aircraft_states.snapshot_id
-        WHERE snapshots.id = (
-            SELECT id FROM snapshots ORDER BY id DESC LIMIT 1
-        )
-        ORDER BY aircraft_states.icao24
-        """
-    ).fetchall()
+def list_zones():
+    with connect() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM zones ORDER BY name")]
 
 
-def get_aircraft_state(
-    connection: sqlite3.Connection,
-    state_id: int,
-) -> sqlite3.Row | None:
-    return connection.execute(
-        """
-        SELECT aircraft_states.*, snapshots.provider_time, snapshots.imported_at
-        FROM aircraft_states
-        JOIN snapshots ON snapshots.id = aircraft_states.snapshot_id
-        WHERE aircraft_states.id = ?
-        """,
-        (state_id,),
-    ).fetchone()
+def get_zone(zone_id):
+    with connect() as c:
+        row = c.execute("SELECT * FROM zones WHERE zone_id=?", (zone_id,)).fetchone()
+        if row is None and cell_zone(zone_id):
+            c.execute("INSERT INTO zones VALUES (?,?,?,?,?,?)", cell_zone(zone_id))
+            row = c.execute("SELECT * FROM zones WHERE zone_id=?", (zone_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def save_observations(aircraft, observed_at):
+    saved = 0
+    with connect() as c:
+        for a in aircraft:
+            if not a["has_position"]:
+                continue
+            last = c.execute("SELECT last_contact FROM aircraft_observations WHERE icao24=? "
+                             "ORDER BY id DESC LIMIT 1", (a["icao24"],)).fetchone()
+            if last and last["last_contact"] == a["last_contact"]:
+                continue  
+            c.execute("""INSERT INTO aircraft_observations (icao24, callsign, origin_country, latitude,
+                longitude, baro_altitude, velocity, true_track, on_ground, last_contact, observed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                      (a["icao24"], a["callsign"], a["origin_country"], a["latitude"], a["longitude"],
+                       a["baro_altitude"], a["velocity"], a["true_track"], int(bool(a["on_ground"])),
+                       a["last_contact"], observed_at))
+            saved += 1
+    return saved
+
+
+def aircraft_history(icao24, limit=50):
+    with connect() as c:
+        rows = c.execute("SELECT * FROM aircraft_observations WHERE icao24=? ORDER BY id DESC LIMIT ?",
+                         (icao24, limit)).fetchall()
+    return [dict(r) for r in rows]

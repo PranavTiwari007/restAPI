@@ -1,112 +1,92 @@
-from dataclasses import dataclass
-import math
-from typing import TypedDict
+import os
+import time
 
-import httpx
+import requests
+from dotenv import load_dotenv
 
+load_dotenv()
 
-TOKEN_URL = (
-    "https://auth.opensky-network.org/auth/realms/opensky-network"
-    "/protocol/openid-connect/token"
-)
-STATES_URL = "https://opensky-network.org/api/states/all"
-
-
-class StateVectorSnapshot(TypedDict):
-    time: int
-    states: list[list[object]]
+TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+API_URL = "https://opensky-network.org/api/states/all"
+TIMEOUT = 15
 
 
-class OpenSkyResponseError(ValueError):
-    """Raised when OpenSky returns a response that does not match its API shape."""
+FIELDS = ["icao24", "callsign", "origin_country", "time_position", "last_contact",
+          "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
+          "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
+          "spi", "position_source"]
 
 
-@dataclass(frozen=True)
-class BoundingBox:
-    lamin: float
-    lomin: float
-    lamax: float
-    lomax: float
+class OpenSkyError(Exception):
 
-    def __post_init__(self) -> None:
-        coordinates = {
-            "lamin": self.lamin,
-            "lomin": self.lomin,
-            "lamax": self.lamax,
-            "lomax": self.lomax,
-        }
-        for name, value in coordinates.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"{name} must be a number")
-            if not math.isfinite(value):
-                raise ValueError(f"{name} must be finite")
-
-        if not -90 <= self.lamin < self.lamax <= 90:
-            raise ValueError("Latitude bounds must be ordered and within -90 to 90")
-        if not -180 <= self.lomin < self.lomax <= 180:
-            raise ValueError("Longitude bounds must be ordered and within -180 to 180")
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.message, self.status = message, status
 
 
-def _response_json(response: httpx.Response, context: str) -> object:
-    try:
-        return response.json()
-    except ValueError as error:
-        raise OpenSkyResponseError(f"OpenSky returned invalid JSON for {context}") from error
+class TokenManager:
+
+    def __init__(self):
+        self.token, self.expires_at = None, 0
+
+    def get(self, force=False):
+        if not force and self.token and time.time() < self.expires_at - 30:
+            return self.token
+        cid, secret = os.getenv("OPENSKY_CLIENT_ID"), os.getenv("OPENSKY_CLIENT_SECRET")
+        if not cid or not secret:
+            raise OpenSkyError("OpenSky credentials are missing in backend/.env", 500)
+        try:
+            r = requests.post(TOKEN_URL, timeout=TIMEOUT, data={
+                "grant_type": "client_credentials", "client_id": cid, "client_secret": secret})
+        except requests.Timeout:
+            raise OpenSkyError("OpenSky login timed out.", 504)
+        except requests.RequestException:
+            raise OpenSkyError("Could not reach the OpenSky login server.", 502)
+        if r.status_code != 200:
+            raise OpenSkyError("OpenSky authentication failed. Check your credentials.", 502)
+        body = r.json()
+        self.token = body["access_token"]
+        self.expires_at = time.time() + body.get("expires_in", 300)
+        return self.token
 
 
-class OpenSkyClient:
-    def __init__(
-        self,
-        client_id: str,
-        client_secret: str,
-        http_client: httpx.AsyncClient,
-    ) -> None:
-        if not client_id.strip() or not client_secret.strip():
-            raise ValueError("OpenSky client ID and client secret are required")
-        self._client_id = client_id
-        self._client_secret = client_secret
-        self._http_client = http_client
+tokens = TokenManager()
 
-    async def fetch_states(self, bounds: BoundingBox) -> StateVectorSnapshot:
-        token_response = await self._http_client.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-            },
-        )
-        token_response.raise_for_status()
-        token_data = _response_json(token_response, "OAuth token")
-        if not isinstance(token_data, dict):
-            raise OpenSkyResponseError("OpenSky returned an invalid OAuth token response")
-        access_token = token_data.get("access_token")
-        if not isinstance(access_token, str) or not access_token:
-            raise OpenSkyResponseError("OpenSky OAuth response did not contain an access token")
 
-        states_response = await self._http_client.get(
-            STATES_URL,
-            params={
-                "lamin": bounds.lamin,
-                "lomin": bounds.lomin,
-                "lamax": bounds.lamax,
-                "lomax": bounds.lomax,
-            },
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        states_response.raise_for_status()
-        payload = _response_json(states_response, "state vectors")
-        if not isinstance(payload, dict):
-            raise OpenSkyResponseError("OpenSky returned an invalid state-vector response")
+def normalize(raw):
+    a = {name: (raw[i] if i < len(raw) else None) for i, name in enumerate(FIELDS)}
+    a["callsign"] = (a["callsign"] or "").strip() or None
+    
+    a["velocity_kmh"] = round(a["velocity"] * 3.6, 1) if a["velocity"] is not None else None
+    a["has_position"] = a["latitude"] is not None and a["longitude"] is not None
+    return a
 
-        provider_time = payload.get("time")
-        if isinstance(provider_time, bool) or not isinstance(provider_time, int):
-            raise OpenSkyResponseError("OpenSky state-vector response is missing a valid time")
 
-        states = payload.get("states")
-        if states is None:
-            states = []
-        if not isinstance(states, list) or any(not isinstance(state, list) for state in states):
-            raise OpenSkyResponseError("OpenSky state-vector response contains invalid states")
+def fetch_states(lamin, lomin, lamax, lomax):
+    params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
+    r = None
+    for attempt in (0, 1):  
+        try:
+            r = requests.get(API_URL, params=params, timeout=TIMEOUT,
+                             headers={"Authorization": f"Bearer {tokens.get(force=attempt == 1)}"})
+        except requests.Timeout:
+            raise OpenSkyError("OpenSky request timed out.", 504)
+        except requests.RequestException:
+            raise OpenSkyError("Could not reach OpenSky.", 502)
+        if r.status_code != 401:
+            break
+    if r.status_code == 401:
+        raise OpenSkyError("OpenSky rejected the access token.", 502)
+    if r.status_code == 403:
+        raise OpenSkyError("OpenSky denied access (HTTP 403).", 502)
+    if r.status_code == 429:
+        wait = r.headers.get("X-Rate-Limit-Retry-After-Seconds")
+        raise OpenSkyError("OpenSky rate limit reached." + (f" Retry in {wait}s." if wait else ""), 429)
+    if r.status_code != 200:
+        raise OpenSkyError(f"OpenSky returned an unexpected status ({r.status_code}).", 502)
 
-        return {"time": provider_time, "states": states}
+    data = r.json()
+    states = data.get("states") or []  
+    remaining = r.headers.get("X-Rate-Limit-Remaining")  
+    return {"time": data.get("time"), "aircraft": [normalize(s) for s in states],
+            "credits_remaining": int(remaining) if remaining and remaining.isdigit() else None}
