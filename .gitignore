@@ -18,7 +18,6 @@ __pycache__/
 node_modules/
 dist/
 *.log
-package-lock.json
 
 # Editors and OS
 .vscode/
