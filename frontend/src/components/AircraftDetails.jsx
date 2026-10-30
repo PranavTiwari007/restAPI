@@ -1,16 +1,33 @@
 import { useEffect, useState } from "react";
-import { getAircraftHistory, num, text, when } from "../api";
+import { getAirportAircraftHistory, num, text, when } from "../api";
 import { ago, climb, direction, height, speed } from "../plain";
 
 const SOURCES = ["ADS-B", "ASTERIX", "MLAT", "FLARM"];
 
-export default function AircraftDetails({ aircraft: a, onClose }) {
-  const [seen, setSeen] = useState(0);
+export default function AircraftDetails({ aircraft: a, airportId, onClose }) {
+  const [seen, setSeen] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState("");
 
   useEffect(() => {
-    setSeen(0);
-    getAircraftHistory(a.icao24).then((h) => setSeen(h.history.length)).catch(() => setSeen(0));
-  }, [a.icao24]);
+    let active = true;
+    setSeen(null);
+    setHistoryLoading(true);
+    setHistoryError("");
+    getAirportAircraftHistory(airportId, a.icao24)
+      .then((history) => {
+        if (active) setSeen(history.history.length);
+      })
+      .catch((error) => {
+        if (active) setHistoryError(error.message);
+      })
+      .finally(() => {
+        if (active) setHistoryLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [airportId, a.icao24]);
 
   const technical = [
     ["ICAO24 code", a.icao24],
@@ -49,7 +66,13 @@ export default function AircraftDetails({ aircraft: a, onClose }) {
         The country shows where the aircraft is registered, not where it took off.
         Departure and destination can't be found from this data.
       </p>
-      {seen > 0 && <p className="muted">This app has recorded this aircraft {seen} time{seen > 1 ? "s" : ""}.</p>}
+      {historyLoading && <p className="muted" role="status">Loading saved history…</p>}
+      {!historyLoading && !historyError && seen !== null && (
+        <p className="muted">
+          This app has recorded this aircraft {seen} time{seen === 1 ? "" : "s"}.
+        </p>
+      )}
+      {historyError && <p className="error" role="alert">Could not load aircraft history: {historyError}</p>}
 
       <details>
         <summary>Technical details</summary>

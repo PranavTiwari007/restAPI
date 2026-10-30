@@ -1,34 +1,69 @@
-CREATE TABLE IF NOT EXISTS snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    provider_time INTEGER NOT NULL,
-    imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    lamin REAL NOT NULL CHECK (lamin >= -90 AND lamin <= 90),
-    lomin REAL NOT NULL CHECK (lomin >= -180 AND lomin <= 180),
-    lamax REAL NOT NULL CHECK (lamax >= -90 AND lamax <= 90),
-    lomax REAL NOT NULL CHECK (lomax >= -180 AND lomax <= 180),
-    CHECK (lamin < lamax),
-    CHECK (lomin < lomax)
+CREATE TABLE IF NOT EXISTS zones (
+    zone_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    lamin REAL,
+    lomin REAL,
+    lamax REAL,
+    lomax REAL
 );
 
-CREATE TABLE IF NOT EXISTS aircraft_states (
+CREATE TABLE IF NOT EXISTS aircraft_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
-    icao24 TEXT NOT NULL CHECK (length(icao24) = 6),
+    icao24 TEXT NOT NULL,
     callsign TEXT,
-    origin_country TEXT NOT NULL,
-    last_contact INTEGER NOT NULL,
-    longitude REAL,
+    origin_country TEXT,
     latitude REAL,
+    longitude REAL,
     baro_altitude REAL,
-    on_ground INTEGER NOT NULL CHECK (on_ground IN (0, 1)),
     velocity REAL,
     true_track REAL,
-    vertical_rate REAL,
-    geo_altitude REAL,
-    squawk TEXT,
-    position_source INTEGER,
-    UNIQUE (snapshot_id, icao24)
+    on_ground INTEGER,
+    last_contact INTEGER,
+    observed_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_aircraft_states_snapshot_icao24
-    ON aircraft_states(snapshot_id, icao24);
+CREATE INDEX IF NOT EXISTS idx_obs
+    ON aircraft_observations (icao24, id);
+
+CREATE TABLE IF NOT EXISTS airport_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    airport_id TEXT NOT NULL,
+    provider_time INTEGER NOT NULL,
+    imported_at INTEGER NOT NULL,
+    lamin REAL NOT NULL,
+    lomin REAL NOT NULL,
+    lamax REAL NOT NULL,
+    lomax REAL NOT NULL,
+    state_count INTEGER NOT NULL,
+    position_count INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_airport_imports_airport_time
+    ON airport_imports (airport_id, provider_time);
+
+CREATE TABLE IF NOT EXISTS airport_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id INTEGER NOT NULL REFERENCES airport_imports(id) ON DELETE CASCADE,
+    icao24 TEXT NOT NULL,
+    callsign TEXT,
+    origin_country TEXT,
+    latitude REAL NOT NULL,
+    longitude REAL NOT NULL,
+    baro_altitude REAL,
+    geo_altitude REAL,
+    velocity REAL,
+    velocity_kmh REAL,
+    true_track REAL,
+    vertical_rate REAL,
+    on_ground INTEGER,
+    last_contact INTEGER,
+    time_position INTEGER,
+    squawk TEXT,
+    position_source INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_airport_observations_import
+    ON airport_observations (import_id);
+
+CREATE INDEX IF NOT EXISTS idx_airport_observations_icao
+    ON airport_observations (icao24, id);

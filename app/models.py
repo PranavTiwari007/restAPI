@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
@@ -45,3 +45,61 @@ class ZoneAircraft(BaseModel):
     saved: int
     credits_used_today: int
     credits_remaining: Optional[int] = None
+
+
+class Airport(BaseModel):
+    airport_id: str
+    iata_code: str
+    name: str
+    city: str
+    country: str
+    airport_type: str
+    latitude: float
+    longitude: float
+    lamin: float
+    lomin: float
+    lamax: float
+    lomax: float
+
+
+class AirportSnapshot(BaseModel):
+    id: int
+    provider_time: int
+    imported_at: int
+    state_count: int
+    position_count: int
+    lamin: float
+    lomin: float
+    lamax: float
+    lomax: float
+
+
+class AirportLatestAircraft(BaseModel):
+    airport: Airport
+    snapshot: AirportSnapshot | None
+    data: List[Aircraft]
+
+
+class AirportImportResponse(BaseModel):
+    import_id: int
+    airport: Airport
+    provider_time: int
+    imported_at: int
+    state_count: int
+    observed_aircraft_count: int
+    credits_used_today: int
+    credits_remaining: Optional[int] = None
+    data: List[Aircraft]
+
+
+class DailyObservationDay(BaseModel):
+    day: str
+    observed_aircraft_count: int | None
+    sample_count: int
+
+
+class DailyObservationsResponse(BaseModel):
+    airport: Airport
+    metric: Literal["distinct_aircraft_observed"]
+    timezone: Literal["UTC"]
+    days: List[DailyObservationDay]

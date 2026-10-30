@@ -2,7 +2,12 @@ import { ago, direction, height, speed } from "../plain";
 
 export default function AircraftCard({ aircraft: a, active, onSelect }) {
   return (
-    <div className={"card" + (active ? " active" : "")} onClick={() => onSelect(a)}>
+    <button
+      type="button"
+      className={"card" + (active ? " active" : "")}
+      onClick={() => onSelect(a)}
+      aria-pressed={active}
+    >
       <div className="row">
         <b className="flight">{a.callsign || "Unknown flight"}</b>
         <span className={"badge " + (a.on_ground ? "ground" : "air")}>
@@ -15,6 +20,6 @@ export default function AircraftCard({ aircraft: a, active, onSelect }) {
         <span>{speed(a)}</span>
         <span>Heading {direction(a.true_track)}</span>
       </div>
-    </div>
+    </button>
   );
 }

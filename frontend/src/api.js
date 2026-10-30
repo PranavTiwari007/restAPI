@@ -1,20 +1,37 @@
 const BASE = "http://127.0.0.1:8000/api";
 
-async function get(path) {
+async function request(path, options = {}) {
   let res;
   try {
-    res = await fetch(BASE + path);
+    res = await fetch(BASE + path, options);
   } catch {
     throw new Error("Cannot reach the backend. Is it running on port 8000?");
   }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.detail || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const detail = body.detail;
+    throw new Error(
+      typeof detail === "string" ? detail : `Request failed (${res.status})`,
+    );
+  }
   return body;
 }
 
-export const getZones = () => get("/zones");
-export const getZoneAircraft = (zoneId) => get(`/zones/${zoneId}/aircraft`);
-export const getAircraftHistory = (icao24) => get(`/aircraft/${icao24}`);
+export const getAirports = () => request("/airports");
+export const getAirportLatest = (airportId) =>
+  request(`/airports/${encodeURIComponent(airportId)}/aircraft`);
+export const getDailyObservations = (airportId, days = 7) =>
+  request(
+    `/airports/${encodeURIComponent(airportId)}/daily-observations?days=${days}`,
+  );
+export const importAirport = (airportId) =>
+  request(`/airports/${encodeURIComponent(airportId)}/imports`, {
+    method: "POST",
+  });
+export const getAirportAircraftHistory = (airportId, icao24) =>
+  request(
+    `/airports/${encodeURIComponent(airportId)}/aircraft/${encodeURIComponent(icao24)}/history`,
+  );
 
 export const num = (v, unit = "", digits = 0) =>
   v === null || v === undefined ? "Not available" : `${Number(v).toFixed(digits)}${unit}`;

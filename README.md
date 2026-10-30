@@ -1,92 +1,109 @@
-# Aircraft State API
+# Airzone
 
-A learning project that will fetch selected live aircraft state data from the OpenSky Network, save snapshots in SQLite, and expose the saved data through a Python REST API.
+Airzone is a React dashboard and FastAPI service for manually collecting and reviewing OpenSky aircraft-state observations around selected airports. It displays the latest saved snapshot, supports callsign/ICAO24 search, and summarizes distinct aircraft observed per UTC day from saved samples.
 
-OpenSky provides ADS-B-derived aircraft tracking information. It does not provide airline schedules or delays. See [plan.md](plan.md) for the planned scope and data fields.
-
-## Current status
-
-The API can manually import bounded OpenSky state vectors, save each import as a SQLite snapshot, and return saved observations. State mapping, OAuth request behavior, and API/database behavior have automated tests; the upstream HTTP calls are mocked in tests.
+OpenSky state vectors are point-in-time observations. They are not airline schedules or verified takeoff/landing records. Daily metrics in this application are **distinct aircraft observed**, not flight movements or a complete count of traffic.
 
 ## Requirements
 
 - Python 3.11 or newer
-- An OpenSky API client (needed for live upstream imports)
+- Node.js and npm
+- OpenSky Network API client credentials for fetching new snapshots
 
-SQLite is included with Python, so there is no separate database server to install.
-
-## Set up on Windows PowerShell
-
-Create a virtual environment and activate it:
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Install application dependencies:
-
-```powershell
-python -m pip install -r requirements.txt
-```
+The backend uses SQLite; no separate database server is needed.
 
 ## Configure OpenSky credentials
 
-Create an API client from the [OpenSky account page](https://opensky-network.org/my-opensky/account). Copy the local example file and enter your credentials:
+Create an API client from the [OpenSky account page](https://opensky-network.org/my-opensky/account). Copy the local example and set `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` in `.env`:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and set `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET`. Keep the values private; `.env` and the SQLite database file are ignored by Git.
+Keep the credentials private. They are used by the backend and are never sent to the browser.
 
-## Run the API
+## Run the applications on Windows PowerShell
+
+In the project root, create and activate a virtual environment and install backend dependencies:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Start the backend in one terminal:
 
 ```powershell
 python -m uvicorn app.main:app --reload
 ```
 
-Then open:
+Start the frontend in a second terminal:
 
-- `http://127.0.0.1:8000/health` — basic service health
-- `http://127.0.0.1:8000/docs` — interactive API documentation
-
-## API routes
-
-- `POST /api/v1/state-imports` — send a geographic bounding box (`lamin`, `lomin`, `lamax`, `lomax`) to fetch and save one OpenSky snapshot.
-- `GET /api/v1/aircraft-states` — read aircraft observations from the latest snapshot only.
-- `GET /api/v1/aircraft-states/{state_id}` — read one saved observation by its database ID, including observations from older snapshots.
-
-To try an import in `/docs`, expand `POST /api/v1/state-imports`, choose **Try it out**, and use this MAA-area example:
-
-```json
-{
-  "lamin": 12.790005,
-  "lomin": 79.969296,
-  "lamax": 13.190005,
-  "lomax": 80.369296
-}
+```powershell
+cd frontend
+npm ci
+npm run dev
 ```
 
-Every submission makes a real OAuth request and a real OpenSky state-vector request. Imports are manual; avoid repeatedly submitting the example because the provider applies request limits.
+Open the frontend URL printed by Vite (normally `http://localhost:5173`). The API documentation is at `http://127.0.0.1:8000/docs`.
 
-An import is all-or-nothing: if a returned state vector is malformed, the API reports an upstream error and does not save a partial snapshot. Older successful snapshots remain in SQLite.
-OpenSky may return no state vectors for a small area at a particular moment. That is recorded as a valid snapshot with `state_count: 0` and an empty `data` list.
+## Airport analysis workflow
+
+1. Search for an airport by name, city, country, or IATA code.
+2. Select the airport to view its saved snapshot and daily observation summary.
+3. Choose **Fetch latest snapshot** to make a manual POST request to OpenSky.
+4. Review the aircraft with usable positions on the map or search the list by callsign or ICAO24.
+
+The catalog in `app/airports.py` includes India's designated international airports (including civil enclaves) and a selected set of airports worldwide; it is not a global airport directory. Airport classifications follow the [List of airports in India](https://en.wikipedia.org/wiki/List_of_airports_in_India), which cites the Airports Authority of India's March 2026 traffic statistics. Reference coordinates are from the [OurAirports public-domain data](https://ourairports.com/data/). Both classifications and coordinates can change; confirm them with the relevant authorities before relying on them.
+
+The map displays the airport reference point and the approximate 22 km by 22 km square centered on that point. Coordinates and area are for analysis only, not for navigation or operational decisions.
+
+Daily values count distinct ICAO24 aircraft with positions in stored airport-area samples for that UTC day. Sampling is manual; select **Fetch latest snapshot** to add a sample. A day with no samples is unknown and shown as missing data, not zero traffic. Repeated samples help build the daily observed-aircraft set; this metric is not a verified count of flight movements. No automatic polling or runway-capacity analysis is included.
+
+## API endpoints
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/api/health` | Service and local credit-limit status |
+| `GET` | `/api/airports?q=chennai` | Search the curated airport catalog |
+| `POST` | `/api/airports/MAA/imports` | Manually fetch and persist an airport-area snapshot |
+| `GET` | `/api/airports/MAA/aircraft` | Read the latest saved airport snapshot |
+| `GET` | `/api/airports/MAA/daily-observations?days=7` | Read daily distinct-aircraft counts and sample coverage (1–90 days) |
+| `GET` | `/api/airports/MAA/aircraft/abc123/history` | Read saved history for an aircraft at one airport |
+
+The older `/api/zones` endpoints remain available for the original map-grid demo. The airport dashboard uses the airport endpoints above.
+
+OpenSky access is subject to provider availability and request limits. The backend applies a local daily credit limit and reports provider errors; avoid repeatedly fetching the same area.
+
+## Data and API limitations
+
+Airzone uses OpenSky's `/states/all` state-vector endpoint. Treat its results as observations, not as a complete picture of airport operations:
+
+- **Coverage is incomplete.** Data depends on aircraft transmissions and receiver coverage, which varies by location and time. A missing aircraft or position does not mean the airspace is empty.
+- **Not schedules or verified movements.** State vectors do not provide airline schedules, routes, destinations, or delays. Seeing an aircraft in an airport-area box does not establish that it is arriving at or departing from that airport, and the API does not provide verified takeoff/landing counts.
+- **Values can be missing or stale.** Callsigns, positions, altitude, speed, and other fields may be null. OpenSky may omit a position when it has not received a recent position update; state vectors can become obsolete and disappear when updates stop.
+- **No routes, ADS-C, or MLAT in this REST API.** OpenSky documents those data types as unavailable through its REST API.
+- **Provider quotas apply.** The current OpenSky documentation lists 4,000 daily credits for standard authenticated access to each endpoint family; the actual allowance depends on the account tier and may change. `/states/all` uses 1–4 credits depending on bounding-box area. Exhausted quotas can return HTTP 429; check the provider's current documentation and `X-Rate-Limit-Remaining` response header.
+- **Manual sampling limits daily summaries.** Airzone only fetches when a user requests a snapshot; it does not continuously poll. Daily distinct-aircraft totals include only aircraft with positions in samples saved that UTC day. Unsampled days are unknown, not zero, and this metric is not a flight-movement count.
+- **Local credit guard is approximate and process-local.** Airzone currently caps requests at 3,000 estimated credits per day. The counter resets when the backend restarts and is not shared across multiple backend processes. OpenSky's own quota remains authoritative.
+- **Airport area and catalog are approximate.** The 22 km square is centered on reference coordinates and is intended for analysis, not navigation or operational decisions. The catalog is not a complete global airport directory, and airport classifications/coordinates may change.
+
+Do not use these observations or derived summaries for operational air-traffic control, navigation, or safety decisions. See the [OpenSky REST API limitations and credit documentation](https://openskynetwork.github.io/opensky-api/rest.html#limitations) and [OpenSky state-vector notes](https://openskynetwork.github.io/opensky-api/).
 
 ## Database and tests
 
-The local database defaults to `data/aircraft.db`. It is created when the API starts; Python's built-in `sqlite3` module means no database server is needed. To inspect it, use a SQLite command-line tool or a SQLite-compatible viewer.
-
-Install test dependencies and run the test suite:
+The local database defaults to `data/airzone.db` and is initialized when the API starts. Run tests with:
 
 ```powershell
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-## Troubleshooting imports
+Build the frontend with:
 
-- `503 OpenSky client credentials are not configured`: confirm `.env` is in the project root and contains non-empty `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` entries. Never print or share their values.
-- `502 Unable to contact the OpenSky service`: check network access to OpenSky and the local server log for the safe failure type. The API does not save a snapshot when the upstream request fails.
-- An OpenSky HTTP error is returned as a `502` with its HTTP status code; check the current OpenSky authentication requirements, request limits, and account status.
-- Outbound HTTPS uses Python's system certificate trust store with certificate verification enabled. Do not disable TLS verification to work around certificate or network errors.
+```powershell
+cd frontend
+npm ci
+npm run build
+```

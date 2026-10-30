@@ -1,8 +1,10 @@
 import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 DB_FILE = Path(__file__).resolve().parent.parent / "data" / "airzone.db"
+SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schema.sql"
 CELL = 4  
 
 
@@ -17,22 +19,13 @@ SEED = [
 def connect():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db():
     with connect() as c:
-        
-        c.execute("""CREATE TABLE IF NOT EXISTS zones (
-            zone_id TEXT PRIMARY KEY, name TEXT NOT NULL,
-            lamin REAL, lomin REAL, lamax REAL, lomax REAL)""")
-        
-        c.execute("""CREATE TABLE IF NOT EXISTS aircraft_observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, icao24 TEXT NOT NULL, callsign TEXT,
-            origin_country TEXT, latitude REAL, longitude REAL, baro_altitude REAL,
-            velocity REAL, true_track REAL, on_ground INTEGER, last_contact INTEGER,
-            observed_at INTEGER NOT NULL)""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_obs ON aircraft_observations (icao24, id)")
+        c.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         c.executemany("INSERT OR IGNORE INTO zones VALUES (?,?,?,?,?,?)", SEED)
 
 
@@ -87,3 +80,153 @@ def aircraft_history(icao24, limit=50):
         rows = c.execute("SELECT * FROM aircraft_observations WHERE icao24=? ORDER BY id DESC LIMIT ?",
                          (icao24, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def save_airport_import(
+    airport_id: str,
+    provider_time: int,
+    imported_at: int,
+    bounds: tuple[float, float, float, float],
+    aircraft: list[dict[str, Any]],
+) -> int:
+    positioned_aircraft = [record for record in aircraft if record["has_position"]]
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO airport_imports (
+                airport_id, provider_time, imported_at, lamin, lomin, lamax, lomax,
+                state_count, position_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                airport_id,
+                provider_time,
+                imported_at,
+                *bounds,
+                len(aircraft),
+                len(positioned_aircraft),
+            ),
+        )
+        import_id = cursor.lastrowid
+        if import_id is None:
+            raise sqlite3.DatabaseError("SQLite did not return an airport import ID")
+        connection.executemany(
+            """
+            INSERT INTO airport_observations (
+                import_id, icao24, callsign, origin_country, latitude, longitude,
+                baro_altitude, geo_altitude, velocity, velocity_kmh, true_track,
+                vertical_rate, on_ground, last_contact, time_position, squawk,
+                position_source
+            ) VALUES (
+                :import_id, :icao24, :callsign, :origin_country, :latitude, :longitude,
+                :baro_altitude, :geo_altitude, :velocity, :velocity_kmh, :true_track,
+                :vertical_rate, :on_ground, :last_contact, :time_position, :squawk,
+                :position_source
+            )
+            """,
+            [
+                {
+                    **record,
+                    "import_id": import_id,
+                    "on_ground": (
+                        int(record["on_ground"])
+                        if record["on_ground"] is not None
+                        else None
+                    ),
+                }
+                for record in positioned_aircraft
+            ],
+        )
+    return import_id
+
+
+def get_latest_airport_import(airport_id: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        latest = connection.execute(
+            """
+            SELECT * FROM airport_imports
+            WHERE airport_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (airport_id,),
+        ).fetchone()
+        if latest is None:
+            return None
+        aircraft = connection.execute(
+            """
+            SELECT * FROM airport_observations
+            WHERE import_id = ?
+            ORDER BY callsign, icao24
+            """,
+            (latest["id"],),
+        ).fetchall()
+    return {
+        "id": latest["id"],
+        "airport_id": latest["airport_id"],
+        "provider_time": latest["provider_time"],
+        "imported_at": latest["imported_at"],
+        "lamin": latest["lamin"],
+        "lomin": latest["lomin"],
+        "lamax": latest["lamax"],
+        "lomax": latest["lomax"],
+        "state_count": latest["state_count"],
+        "position_count": latest["position_count"],
+        "aircraft": [
+            {
+                **dict(record),
+                "on_ground": (
+                    bool(record["on_ground"])
+                    if record["on_ground"] is not None
+                    else None
+                ),
+                "has_position": True,
+            }
+            for record in aircraft
+        ],
+    }
+
+
+def get_daily_airport_counts(
+    airport_id: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict[str, int | str]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                date(imports.provider_time, 'unixepoch') AS day,
+                COUNT(DISTINCT observations.icao24) AS observed_aircraft_count,
+                COUNT(DISTINCT imports.id) AS sample_count
+            FROM airport_imports AS imports
+            LEFT JOIN airport_observations AS observations
+                ON observations.import_id = imports.id
+            WHERE imports.airport_id = ?
+                AND date(imports.provider_time, 'unixepoch') BETWEEN ? AND ?
+            GROUP BY date(imports.provider_time, 'unixepoch')
+            ORDER BY day
+            """,
+            (airport_id, start_date, end_date),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_airport_aircraft_history(
+    airport_id: str,
+    icao24: str,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT observations.*, imports.airport_id, imports.provider_time,
+                imports.imported_at
+            FROM airport_observations AS observations
+            JOIN airport_imports AS imports ON imports.id = observations.import_id
+            WHERE imports.airport_id = ? AND observations.icao24 = ?
+            ORDER BY imports.provider_time DESC, imports.id DESC
+            LIMIT ?
+            """,
+            (airport_id, icao24, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]

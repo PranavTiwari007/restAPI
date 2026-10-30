@@ -1,151 +1,99 @@
+from datetime import date
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-import httpx
 import pytest
 
-from app.main import app, get_opensky_client
-from app.opensky_client import BoundingBox
+from app import database
+from app import main
 
 
-def state_vector(icao24: str = "abc123") -> list[object]:
-    return [
-        icao24,
-        " TEST123 ",
-        "Exampleland",
-        100,
-        101,
-        12.5,
-        45.6,
-        9000.0,
-        False,
-        220.5,
-        180.0,
-        -1.2,
-        None,
-        9100.0,
-        "1234",
-        False,
-        0,
-    ]
-
-
-class FakeOpenSkyClient:
-    def __init__(self, states: list[list[object]]) -> None:
-        self.states = states
-        self.bounds: BoundingBox | None = None
-
-    async def fetch_states(self, bounds: BoundingBox) -> dict[str, object]:
-        self.bounds = bounds
-        return {"time": 123, "states": self.states}
-
-
-class FailingOpenSkyClient:
-    async def fetch_states(self, bounds: BoundingBox) -> dict[str, object]:
-        raise httpx.ConnectError(
-            "mock connection failure",
-            request=httpx.Request("GET", "https://opensky-network.org/api/states/all"),
-        )
+def state(icao24: str = "abc123") -> dict[str, object]:
+    return {
+        "icao24": icao24,
+        "callsign": "TEST123",
+        "origin_country": "Exampleland",
+        "time_position": 100,
+        "last_contact": 101,
+        "longitude": 72.8656,
+        "latitude": 19.0896,
+        "baro_altitude": 9000.0,
+        "on_ground": False,
+        "velocity": 220.5,
+        "velocity_kmh": 793.8,
+        "true_track": 180.0,
+        "vertical_rate": -1.2,
+        "geo_altitude": 9100.0,
+        "squawk": "1234",
+        "position_source": 0,
+        "has_position": True,
+    }
 
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "aircraft.db"))
-    with TestClient(app) as test_client:
+    monkeypatch.setattr(database, "DB_FILE", tmp_path / "airzone.db")
+    main.cache.clear()
+    main.usage.update(day=date.today(), credits=0)
+    with TestClient(main.app) as test_client:
         yield test_client
-    app.dependency_overrides.pop(get_opensky_client, None)
 
 
-def test_imports_snapshot_and_reads_latest_aircraft_states(
-    client: TestClient,
-) -> None:
-    fake_opensky = FakeOpenSkyClient([state_vector()])
-    app.dependency_overrides[get_opensky_client] = lambda: fake_opensky
+def test_lists_seeded_zones(client: TestClient) -> None:
+    response = client.get("/api/zones")
 
-    imported = client.post(
-        "/api/v1/state-imports",
-        json={"lamin": 45, "lomin": 5, "lamax": 47, "lomax": 8},
-    )
-
-    assert imported.status_code == 201
-    assert imported.json()["provider_time"] == 123
-    assert imported.json()["imported_count"] == 1
-    assert fake_opensky.bounds == BoundingBox(45, 5, 47, 8)
-
-    latest = client.get("/api/v1/aircraft-states")
-
-    assert latest.status_code == 200
-    assert latest.json()["snapshot"]["state_count"] == 1
-    assert latest.json()["data"][0]["icao24"] == "abc123"
-    assert latest.json()["data"][0]["callsign"] == "TEST123"
-    assert latest.json()["data"][0]["on_ground"] is False
-
-    state_id = latest.json()["data"][0]["id"]
-    detail = client.get(f"/api/v1/aircraft-states/{state_id}")
-    assert detail.status_code == 200
-    assert detail.json()["provider_time"] == 123
+    assert response.status_code == 200
+    assert {zone["zone_id"] for zone in response.json()} >= {"mumbai", "chennai"}
 
 
-def test_malformed_vector_rolls_back_entire_snapshot(client: TestClient) -> None:
-    fake_opensky = FakeOpenSkyClient([state_vector(), ["not", "a", "complete", "vector"]])
-    app.dependency_overrides[get_opensky_client] = lambda: fake_opensky
+def test_resolves_map_grid_zone(client: TestClient) -> None:
+    response = client.get("/api/zones/R44C63")
 
-    imported = client.post(
-        "/api/v1/state-imports",
-        json={"lamin": 45, "lomin": 5, "lamax": 47, "lomax": 8},
-    )
-
-    assert imported.status_code == 502
-    assert imported.json()["detail"] == "OpenSky returned a malformed aircraft state vector"
-    assert client.get("/api/v1/aircraft-states").json() == {
-        "snapshot": None,
-        "data": [],
-    }
+    assert response.status_code == 200
+    assert response.json()["zone_id"] == "R44C63"
+    assert response.json()["lamin"] == 86
+    assert response.json()["lomin"] == 72
 
 
-def test_import_rejects_reversed_bounds(client: TestClient) -> None:
-    imported = client.post(
-        "/api/v1/state-imports",
-        json={"lamin": 47, "lomin": 5, "lamax": 45, "lomax": 8},
-    )
-
-    assert imported.status_code == 422
-
-
-def test_import_reports_missing_opensky_credentials(
+def test_zone_fetch_saves_observations_and_caches_repeat(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
-    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
+    calls = 0
 
-    imported = client.post(
-        "/api/v1/state-imports",
-        json={"lamin": 45, "lomin": 5, "lamax": 47, "lomax": 8},
-    )
+    def fake_fetch_states(*bounds: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        assert len(bounds) == 4
+        return {
+            "time": 123,
+            "aircraft": [state()],
+            "credits_remaining": 2500,
+        }
 
-    assert imported.status_code == 503
-    assert imported.json()["detail"] == "OpenSky client credentials are not configured"
+    monkeypatch.setattr(main, "fetch_states", fake_fetch_states)
+
+    first = client.get("/api/zones/mumbai/aircraft")
+    second = client.get("/api/zones/mumbai/aircraft")
+
+    assert first.status_code == 200
+    assert first.json()["count"] == 1
+    assert first.json()["saved"] == 1
+    assert second.json()["cached"] is True
+    assert calls == 1
+
+    history = client.get("/api/aircraft/abc123")
+    assert history.status_code == 200
+    assert history.json()["latest"]["callsign"] == "TEST123"
 
 
-def test_import_reports_network_failure_without_logging_secrets(
-    client: TestClient,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    app.dependency_overrides[get_opensky_client] = lambda: FailingOpenSkyClient()
+def test_unknown_zone_returns_404(client: TestClient) -> None:
+    response = client.get("/api/zones/not-a-zone")
 
-    imported = client.post(
-        "/api/v1/state-imports",
-        json={"lamin": 45, "lomin": 5, "lamax": 47, "lomax": 8},
-    )
-
-    assert imported.status_code == 502
-    assert imported.json()["detail"] == "Unable to contact the OpenSky service"
-    assert "ConnectError" in caplog.text
-    assert "test-secret" not in caplog.text
+    assert response.status_code == 404
 
 
-def test_unknown_aircraft_state_returns_404(client: TestClient) -> None:
-    response = client.get("/api/v1/aircraft-states/999")
+def test_unknown_aircraft_returns_404(client: TestClient) -> None:
+    response = client.get("/api/aircraft/abc123")
 
     assert response.status_code == 404
