@@ -4,7 +4,7 @@
 
 Build a beginner-friendly Python project that consumes live aircraft state data from the OpenSky Network REST API, stores selected state-vector observations in SQLite, and exposes those stored observations through its own REST API. OpenSky provides ADS-B-derived aircraft positions and tracking data; it does not provide commercial airline schedules or delays. SQLite stores the database in a local file and does not require a separate database server or Workbench.
 
-Use Python's built-in `sqlite3` module and store the database in a local file such as `data/aircraft.db`. Do not commit the database file or OpenSky client secrets to GitHub; commit the schema, setup instructions, and `.env.example` instead.
+Use Python's built-in `sqlite3` module and store the database in a local file such as `data/airzone.db`. Do not commit the database file or OpenSky client secrets to GitHub; commit the schema, setup instructions, and `.env.example` instead.
 
 Keep upstream calls explicit and bounded: a manual `POST /api/v1/state-imports` action accepts a validated geographic bounding box, fetches the current state vectors in that area from OpenSky's `GET /api/states/all` endpoint, selects the agreed fields, and saves the observations with the snapshot time. `GET /api/v1/aircraft-states` and `GET /api/v1/aircraft-states/{id}` read saved observations from SQLite; they do not call OpenSky. This makes the data flow clear and avoids unnecessary upstream requests.
 
